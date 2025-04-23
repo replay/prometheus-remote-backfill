@@ -14,8 +14,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,40 +32,87 @@ var (
 	writeURL     = flag.String("url", "", "URL for remote write endpoint")
 	writeTimeout = flag.Duration("write_timeout", 5*time.Minute, "write timeout")
 	batchSize    = flag.Uint("batch_size", 100000, "number of samples per request")
+	requestSpan  = flag.Duration("request_span", time.Minute, "maximum duration that one request can span in terms of samples it contains")
 	concurrency  = flag.Uint("concurrency", 1, "number of influxdb writers")
+	headersStr   = flag.String("headers", "", "additional HTTP headers. must be pairs seperated by \",\", the pairs are split by \":\", for example \"X-Scope-OrgID:1234,X-Org-Id:1234\"")
+	headers      = make(map[string]string)
 )
 
 // converts a slice of SampleStream messages into remote write requests and sends them into the channel.
 func generateWriteRequests(streams []*model.SampleStream, requests chan<- *prompb.WriteRequest) {
-	req := &prompb.WriteRequest{
-		Timeseries: make([]*prompb.TimeSeries, 0),
-	}
-
-	totalSamples := uint(0)
+	lowestTimestamp := int64(math.MaxInt64)
+	highestTimestamp := int64(math.MinInt64)
 	for _, s := range streams {
-		samples := make([]*prompb.Sample, 0, len(s.Values))
 		for _, v := range s.Values {
-			samples = append(samples, &prompb.Sample{
-				Value:     float64(v.Value),
-				Timestamp: int64(v.Timestamp),
-			})
-			totalSamples++
-		}
-		ts := prompb.TimeSeries{
-			Labels:  metricToLabelProtos(s.Metric),
-			Samples: samples,
-		}
-		req.Timeseries = append(req.Timeseries, &ts)
-		if totalSamples > *batchSize {
-			log.Printf("Sending batch of %d samples", totalSamples)
-			totalSamples = 0
-			requests <- req
-			req = &prompb.WriteRequest{Timeseries: make([]*prompb.TimeSeries, 0)}
+			timestamp := int64(v.Timestamp)
+			if timestamp < lowestTimestamp {
+				lowestTimestamp = timestamp
+			}
+			if timestamp > highestTimestamp {
+				highestTimestamp = timestamp
+			}
 		}
 	}
 
-	log.Printf("Sending batch of %d samples", totalSamples)
-	requests <- req
+	log.Printf("Lowest timestamp: %v", time.UnixMilli(lowestTimestamp))
+	log.Printf("Highest timestamp: %v", time.UnixMilli(highestTimestamp))
+
+	// Align the start time to the nearest multiple of requestSpan
+	alignedStart := (lowestTimestamp / requestSpan.Milliseconds()) * requestSpan.Milliseconds()
+
+	for timeStart := alignedStart; timeStart <= highestTimestamp; timeStart += requestSpan.Milliseconds() {
+		timeEnd := timeStart + requestSpan.Milliseconds()
+
+		spanReq := &prompb.WriteRequest{
+			Timeseries: make([]*prompb.TimeSeries, 0),
+		}
+
+		totalSamples := uint(0)
+		spanSamples := uint(0)
+		for _, s := range streams {
+			samples := make([]*prompb.Sample, 0)
+			for _, v := range s.Values {
+				ts := int64(v.Timestamp)
+				if ts >= timeStart && ts < timeEnd {
+					samples = append(samples, &prompb.Sample{
+						Value:     float64(v.Value),
+						Timestamp: ts,
+					})
+					totalSamples++
+					spanSamples++
+
+				}
+			}
+
+			if len(samples) > 0 {
+				labelStr := ""
+				for _, l := range metricToLabelProtos(s.Metric) {
+					labelStr += fmt.Sprintf("%s=%s, ", l.Name, l.Value)
+				}
+				// Trim trailing comma and space
+				labelStr = strings.TrimSuffix(labelStr, ", ")
+
+				log.Printf("Time series {%s} has %d samples in time range [%v, %v]",
+					labelStr,
+					len(samples),
+					time.UnixMilli(samples[0].Timestamp),
+					time.UnixMilli(samples[len(samples)-1].Timestamp))
+				ts := prompb.TimeSeries{
+					Labels:  metricToLabelProtos(s.Metric),
+					Samples: samples,
+				}
+				spanReq.Timeseries = append(spanReq.Timeseries, &ts)
+			}
+		}
+
+		if spanSamples > 0 {
+			log.Printf("Sending batch of %d samples for time window [%v, %v]",
+				spanSamples,
+				time.UnixMilli(timeStart),
+				time.UnixMilli(timeEnd))
+			requests <- spanReq
+		}
+	}
 }
 
 // metricToLabelProtos builds a []*prompb.Label from a model.Metric
@@ -101,6 +150,9 @@ func write(client *http.Client, req *prompb.WriteRequest) error {
 	httpReq.Header.Add("Content-Encoding", "snappy")
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	httpReq.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *writeTimeout)
 	defer cancel()
@@ -134,6 +186,16 @@ func main() {
 
 	if len(flag.Args()) == 0 {
 		log.Fatalln("Please specify at least one input file as a command line argument")
+	}
+
+	if len(*headersStr) > 0 {
+		for _, header := range strings.Split(*headersStr, ",") {
+			parts := strings.Split(header, ":")
+			if len(parts) != 2 {
+				log.Fatalf("Invalid header format: %s", header)
+			}
+			headers[parts[0]] = parts[1]
+		}
 	}
 
 	// Buffer 20 requests in RAM to allow the next json file to be read while
