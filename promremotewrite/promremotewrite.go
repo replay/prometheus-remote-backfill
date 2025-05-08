@@ -190,7 +190,7 @@ func main() {
 
 	if len(*headersStr) > 0 {
 		for _, header := range strings.Split(*headersStr, ",") {
-			parts := strings.Split(header, ":")
+			parts := strings.SplitN(header, ":", 2)
 			if len(parts) != 2 {
 				log.Fatalf("Invalid header format: %s", header)
 			}
